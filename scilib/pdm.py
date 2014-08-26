@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Copyright 2014 Peter Williams <peter@newton.cx>
 # Licensed under the GNU General Public License, version 3 or higher.
 
@@ -21,6 +22,8 @@ attempts to improve a few aspects; see
 from __future__ import division
 import numpy as np
 from collections import namedtuple
+import time
+from multiprocessing import Pool
 
 
 PDMResult = namedtuple ('PDMResult', 'thetas imin pmin mc_tmins '
@@ -28,24 +31,13 @@ PDMResult = namedtuple ('PDMResult', 'thetas imin pmin mc_tmins '
 
 
 def weighted_variance (x, wt):
-    """Essentially copied from Wikipedia (woo!), which cites West (1979, Comm.
-    ACM, 22 (9) 532)."""
+    """Biased weighted sample variance per Wikipedia 
+    using built-in functions"""
 
-    n = x.size
-    tot_weight = 0.
-    mean = 0.
-    tot_numer = 0.
-
-    for i in xrange (n):
-        next_tot_weight = wt[i] + tot_weight
-        delta = x[i] - mean
-        r = delta * wt[i] / next_tot_weight
-
-        mean += r
-        tot_numer += tot_weight * delta * r
-        tot_weight = next_tot_weight
-
-    return tot_numer / tot_weight * n / (n - 1.)
+    wtavg = np.average(x, weights=wt)
+    wtvar = np.average((x-wtavg)**2, weights=wt)
+    
+    return wtvar
 
 
 def one_theta (t, x, wt, period, nbin, nshift, v_all):
@@ -66,8 +58,17 @@ def one_theta (t, x, wt, period, nbin, nshift, v_all):
 
     return numer / (denom * v_all)
 
+# multiprocessing can only deal with one input parameter
+# parse the list here
+def one_theta_feeder (data_list):
+    
+    (t, x, wt, period, nbin, nshift, v_all) = data_list ## map can only take a single argument
+    result = one_theta(t, x, wt, period, nbin, nshift, v_all)
 
-def pdm (t, x, u, periods, nbin, nshift=8, nsmc=256, numc=256):
+    return result
+
+def pdm (t, x, u, periods, nbin, nshift=8, nsmc=256, numc=256, weights=False,
+         nprocesses = 8):
     """Perform phase dispersion minimization.
 
     `t` - 1D array - time coordinate
@@ -106,6 +107,7 @@ def pdm (t, x, u, periods, nbin, nshift=8, nsmc=256, numc=256):
     nbin = int (nbin)
     nshift = int (nshift)
     nsmc = int (nsmc)
+    numc = int (numc)
 
     if t.ndim != 1:
         raise ValueError ('`t` must be <= 1D')
@@ -128,34 +130,49 @@ def pdm (t, x, u, periods, nbin, nshift=8, nsmc=256, numc=256):
     if nsmc < 0:
         raise ValueError ('`nsmc` must be nonnegative')
 
+    if numc < 0:
+        raise ValueError ('`numc` must be nonnegative')
+        
     # We can finally get started!
 
-    wt = u ** -2
+    # allow weights or data uncertainties to be supplied
+    if weights:
+        wt = u
+        u = wt ** -2
+    else:
+        wt = u ** -2
     v_all = weighted_variance (x, wt)
 
     thetas = np.empty (periods.shape)
 
+    args = [None]*periods.size
     for i in xrange (periods.size):
-        thetas[i] = one_theta (t, x, wt, periods[i], nbin, nshift, v_all)
+        args[i] = (t, x, wt, periods[i], nbin, nshift, v_all)
+
+    # do period search with worker processes    
+    pool = Pool(nprocesses)
+    thetas_list = pool.map(one_theta_feeder, args)
+    thetas = np.array(thetas_list)
 
     imin = thetas.argmin ()
     pmin = periods[imin]
 
     # Now do the Monte Carlo jacknifing so that the caller can have some idea
-    # as to the significance of the minimal value of `thetas`. XXX: ripe for
-    # parallelization.
+    # as to the significance of the minimal value of `thetas`.
 
-    mc_thetas = np.empty (periods.shape)
     mc_tmins = np.empty (nsmc)
-
+    
     for i in xrange (nsmc):
         shuf = np.random.permutation (x.size)
-
+        args = [None]*periods.size
+        
         for j in xrange (periods.size):
-            mc_thetas[j] = one_theta (t, x[shuf], wt[shuf], periods[j],
-                                      nbin, nshift, v_all)
+            args[j] = (t, x[shuf], wt[shuf], periods[j], nbin, nshift, v_all)
 
-        mc_tmins[i] = mc_thetas.min ()
+        # do period search with worker processes    
+        thetas_list = pool.map(one_theta_feeder, args)
+        mc_thetas = np.array(thetas_list)
+        mc_tmins[i] = np.array(thetas_list).min()
 
     mc_tmins.sort ()
     mc_pvalue = mc_tmins.searchsorted (thetas[imin]) / nsmc
@@ -168,16 +185,21 @@ def pdm (t, x, u, periods, nbin, nshift=8, nsmc=256, numc=256):
         noised = np.random.normal (x, u)
 
         for j in xrange (periods.size):
-            mc_thetas[j] = one_theta (t, noised, wt, periods[j],
-                                      nbin, nshift, v_all)
+            args[j] = (t, noised, wt, periods[j], nbin, nshift, v_all)
 
+        # do period search with worker processes    
+        thetas_list = pool.map(one_theta_feeder, args)
+        mc_thetas = np.array(thetas_list)
         mc_pmins[i] = periods[mc_thetas.argmin ()]
 
     mc_pmins.sort ()
     mc_puncert = mc_pmins.std ()
 
+    # don't forget to close the pool!!
+    pool.terminate()
+    pool.join()
+    
     # All done.
-
     return PDMResult (thetas=thetas, imin=imin, pmin=pmin, mc_tmins=mc_tmins,
                       mc_pvalue=mc_pvalue, mc_pmins=mc_pmins,
                       mc_puncert=mc_puncert)
